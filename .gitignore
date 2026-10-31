@@ -1,0 +1,4 @@
+build/gemm_*
+results/experiments.db
+__pycache__/
+.env
