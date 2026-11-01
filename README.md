@@ -1,99 +1,138 @@
 # CUDA Kernel Tuning Agent
 
-I built this project to learn how GPU matrix multiplication is optimized, and to see whether an
-LLM agent could help search for faster kernel configurations.
+An AI agent that experiments with CUDA matrix multiplication (SGEMM) kernels and uses benchmark results to guide its own optimization decisions.
 
-The agent picks a kernel configuration, compiles it with `nvcc`, benchmarks it against cuBLAS,
-checks that the output is correct, and logs the result. It then looks at everything it has tried
-so far and decides what to test next.
+The agent proposes kernel configurations, compiles them with `nvcc`, benchmarks them against NVIDIA cuBLAS, validates correctness, and logs each experiment to SQLite. An LLM analyzes previous results and suggests what configuration to test next.
 
-## How it works
+The goal was to explore GPU performance optimization while building an agent that interacts with real compilation, benchmarking, and profiling workflows.
 
-```
-propose -> compile (nvcc) -> benchmark + correctness check -> log to SQLite -> analyze
-   ^                                                                            |
-   +------------------------------ next iteration ------------------------------+
-```
+## Results
 
-### Kernels (`kernels/gemm.cu`)
+Benchmarked on an NVIDIA Tesla T4 GPU (Google Colab) using 2048 × 2048 single-precision matrices (FP32).
 
-All three kernels compute single-precision matrix multiplication (C = A x B) in row-major order.
+| Kernel | Configuration | GFLOPS | Speedup vs. Naive | % of cuBLAS |
+|---|---|---:|---:|---:|
+| Naive | 16 × 16 block | 423 | 1.0× | 8.9% |
+| Tiled | TILE=32 | 799 | 1.9× | 16.1% |
+| Coarsened | TILE=32, COARSEN=4 | 1,367 | 3.2× | 29.9% |
+| **Best Coarsened** | **TILE=32, COARSEN=16** | **1,749** | **4.1×** | **38.3%** |
 
-1. **Naive:** each thread computes one output element and reads directly from global memory.
-2. **Shared-memory tiling:** each block loads tiles of A and B into shared memory, so every
-   value read from global memory is reused across the whole tile.
-3. **Tiling with thread coarsening:** each thread computes several output rows instead of one,
-   which reuses values loaded from shared memory and keeps more work in registers.
+The tuning agent evaluated 12 configurations, with the best-performing kernel reaching 1,749 GFLOPS, a 4.1× improvement over the naive implementation. All tested configurations passed correctness validation against cuBLAS.
 
-Each kernel is timed with CUDA events over several runs after a warm-up, and compared with
-cuBLAS for both speed and correctness. Since cuBLAS is column-major, the baseline computes
-C^T = B^T x A^T, which gives the same result as the row-major product.
+![GFLOPS comparison](results/gflops.png)
 
-### Benchmark harness (`bench/run_benchmark.py`)
+### Key Observations
 
-Before compiling, the harness checks each configuration against hardware limits: at most 1024
-threads per block and 48 KB of shared memory per block. It then compiles the configuration,
-runs it, and records:
+- **Shared-memory tiling:** Improved performance by approximately 1.9× by reducing redundant global memory accesses through data reuse.
+- **Thread coarsening:** Further improved performance by having each thread compute multiple output elements, increasing data reuse and work per thread.
+- **Configuration tuning:** Increasing the coarsening factor from 4 to 16 improved performance from 1,367 to 1,749 GFLOPS.
 
-- runtime (ms) and GFLOPS
-- percentage of cuBLAS performance
-- compile time
-- maximum error compared with cuBLAS
+## How It Works
 
-### Agent (`agent/graph.py`)
+The agent follows an iterative optimization loop:
 
-The agent is a LangGraph loop with three steps: propose, evaluate, and analyze.
-
-- If `OPENAI_API_KEY` is set, an LLM reads the results so far and suggests the next
-  configuration, along with a short reason.
-- If the key is not set, or the suggestion is invalid or already tested, it falls back to
-  working through a fixed search space, so the loop always finishes.
-
-Every run is saved to SQLite (`agent/store.py`), so different runs can be compared later.
-
-### Profiling (`bench/profile.py`)
-
-Collects Nsight Compute metrics for a configuration (compute throughput, memory throughput, and
-achieved occupancy) to help explain why one kernel is faster than another.
-
-## Project structure
-
-```
-kernels/gemm.cu           CUDA kernels, cuBLAS baseline, and correctness check
-bench/run_benchmark.py    validates, compiles, and runs a configuration
-bench/profile.py          Nsight Compute metrics
-agent/graph.py            LangGraph tuning loop
-agent/store.py            SQLite experiment log
-scripts/plot_results.py   GFLOPS chart compared with cuBLAS
-Makefile                  build shortcuts
+```text
+propose → compile (nvcc) → benchmark + correctness check
+   ↑                              ↓
+   └──── analyze ← log to SQLite ─┘
 ```
 
-## Running it
+- **Propose:** LangGraph coordinates the optimization loop. An LLM reviews previous experiments and suggests a new configuration with a short explanation.
+- **Evaluate:** The benchmark harness validates hardware constraints, compiles the kernel, measures execution time using CUDA events, and compares results against cuBLAS.
+- **Analyze:** Results are stored in SQLite and used to guide subsequent proposals.
 
-I ran this on Google Colab with an NVIDIA T4 GPU (Runtime > Change runtime type > T4 GPU).
+If `OPENAI_API_KEY` is not set, or an LLM proposal is invalid or has already been tested, the agent falls back to systematic configuration search.
+
+## CUDA Kernels
+
+Implemented in `kernels/gemm.cu`. All three kernels compute single-precision matrix multiplication, C = A × B.
+
+1. **Naive:** Each thread computes one output element using global memory.
+2. **Shared-memory tiling:** Threads cooperatively load matrix tiles into shared memory to reduce redundant global memory accesses.
+3. **Tiling + thread coarsening:** Each thread computes multiple output elements, increasing data reuse and reducing redundant work.
+
+cuBLAS uses column-major storage, so the benchmark computes Cᵀ = Bᵀ × Aᵀ to get the equivalent row-major result.
+
+## Benchmarking & Profiling
+
+The benchmark harness (`bench/run_benchmark.py`) validates hardware constraints before compiling and executing each configuration.
+
+It records:
+- Kernel execution time and GFLOPS.
+- Percentage of cuBLAS performance.
+- Compilation time.
+- Maximum numerical error and correctness status.
+
+The profiling script (`bench/profile.py`) uses NVIDIA Nsight Compute to collect compute throughput, memory throughput, and achieved occupancy to help identify performance bottlenecks.
+
+## Project Structure
+
+```text
+cuda-kernel-tuning-agent/
+├── kernels/
+│   └── gemm.cu              # CUDA kernel implementations
+├── bench/
+│   ├── run_benchmark.py     # Benchmarking and correctness
+│   └── profile.py           # Nsight Compute profiling
+├── agent/
+│   ├── graph.py             # LangGraph optimization loop
+│   └── store.py             # SQLite experiment tracking
+├── scripts/
+│   └── plot_results.py      # GFLOPS visualization
+├── results/
+│   └── gflops.png           # Benchmark comparison
+├── Makefile
+└── requirements.txt
+```
+
+## Running the Project
+
+Experiments were run using Google Colab with an NVIDIA Tesla T4 GPU.
+
+### 1. Clone and install
 
 ```bash
 git clone https://github.com/charmikadi/cuda-kernel-tuning-agent.git
 cd cuda-kernel-tuning-agent
 pip install -r requirements.txt
-
-make all                           # build the three kernels
-python -m bench.run_benchmark      # benchmark them against cuBLAS
-
-export OPENAI_API_KEY=your_key     # optional, enables the LLM proposer
-python -m agent.graph --iters 12   # run the tuning agent
-python -m scripts.plot_results     # saves results/gflops.png
-python -m bench.profile            # optional, needs Nsight Compute
 ```
 
-The default architecture is `sm_75` (T4). For other GPUs, set `CUDA_ARCH` and pass `ARCH` to
-make, for example `sm_80` for an A100 or `sm_86` for an RTX 30-series card:
+### 2. Verify GPU and CUDA
 
 ```bash
-export CUDA_ARCH=sm_80
-make all ARCH=sm_80
+nvidia-smi
+nvcc --version
 ```
 
-## Tech stack
+### 3. Compile and benchmark
 
-CUDA, C++, cuBLAS, Nsight Compute, Python, LangGraph, OpenAI API, SQLite, Matplotlib
+```bash
+make all
+python -m bench.run_benchmark
+```
+
+### 4. Run the optimization agent
+
+```bash
+export OPENAI_API_KEY=your_api_key  # Optional
+python -m agent.graph --iters 12
+```
+
+### 5. Generate results and profile
+
+```bash
+python -m scripts.plot_results
+python -m bench.profile  # Requires Nsight Compute
+```
+
+**GPU architecture:** The default is `sm_75` for the NVIDIA Tesla T4. For an A100, use `sm_80`; for an RTX 30-series GPU, use `sm_86`.
+
+## Tech Stack
+
+**CUDA · C++ · Python · cuBLAS · LangGraph · OpenAI API · SQLite · Nsight Compute · Matplotlib**
+
+## Future Improvements
+
+- Explore warp-level primitives and more advanced memory optimizations.
+- Incorporate Nsight Compute metrics directly into the agent's optimization decisions.
+- Expand testing across different matrix sizes and NVIDIA GPU architectures.
